@@ -341,6 +341,62 @@ async def test_call_tool_async_per_call_meta_overrides_client_meta(mock_transpor
         assert received_meta["com.example/request_id"] == "per-call"
 
 
+@pytest.mark.parametrize(
+    ("meta", "meta_provider", "exp_meta"),
+    [
+        (None, None, None),
+        ({"com.example/a": 1}, None, None),
+        ({"com.example/a": 1}, lambda tool_use, invocation_state: None, None),
+        (None, lambda tool_use, invocation_state: {"com.example/b": 2}, {"com.example/b": 2}),
+        (
+            {"com.example/a": 1, "com.example/b": 1},
+            lambda tool_use, invocation_state: {"com.example/b": 2},
+            {"com.example/a": 1, "com.example/b": 2},
+        ),
+    ],
+    ids=["nothing", "client-meta-only", "provider-returns-none", "provider-only", "provider-merged-over-client"],
+)
+def test_resolve_tool_meta(mock_transport, meta, meta_provider, exp_meta):
+    """Test None lets call_tool_async fall back to the client-level meta, and provided keys win over it."""
+    client = MCPClient(mock_transport["transport_callable"], meta=meta, meta_provider=meta_provider)
+
+    tru_meta = client._resolve_tool_meta({"toolUseId": "test-123", "name": "test_tool", "input": {}}, {})
+
+    assert tru_meta == exp_meta
+
+
+def test_resolve_tool_meta_calls_the_provider_with_the_tool_use_and_invocation_state(mock_transport):
+    class MetaProvider:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, tool_use, invocation_state, **kwargs):
+            self.calls.append((tool_use, invocation_state, kwargs))
+            return {"com.example/user": invocation_state["user"]}
+
+    meta_provider = MetaProvider()
+    client_meta = {"com.example/app": "demo"}
+    client = MCPClient(mock_transport["transport_callable"], meta=client_meta, meta_provider=meta_provider)
+    tool_use = {"toolUseId": "test-123", "name": "test_tool", "input": {}}
+    invocation_state = {"user": "alice"}
+
+    tru_meta = client._resolve_tool_meta(tool_use, invocation_state)
+
+    assert meta_provider.calls == [(tool_use, invocation_state, {})]
+    assert tru_meta == {"com.example/app": "demo", "com.example/user": "alice"}
+    assert client_meta == {"com.example/app": "demo"}
+
+
+def test_resolve_tool_meta_propagates_a_provider_error(mock_transport):
+    def meta_provider(tool_use, invocation_state):
+        raise KeyError("user")
+
+    client = MCPClient(mock_transport["transport_callable"], meta_provider=meta_provider)
+
+    with pytest.raises(KeyError, match="user"):
+        client._resolve_tool_meta({"toolUseId": "test-123", "name": "test_tool", "input": {}}, {})
+
+
 def test_call_tool_sync_pre_set_cancel_signal_skips_request(mock_transport, mock_session):
     """Test a pre-set cancellation signal short-circuits before sending a request."""
     cancel_signal = threading.Event()

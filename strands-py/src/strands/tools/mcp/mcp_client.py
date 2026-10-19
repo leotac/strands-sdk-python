@@ -60,7 +60,7 @@ from typing_extensions import Protocol, TypedDict
 from ...types import PaginatedList
 from ...types.exceptions import MCPClientInitializationError, ToolProviderException
 from ...types.media import ImageFormat
-from ...types.tools import AgentTool, ToolResultContent, ToolResultStatus
+from ...types.tools import AgentTool, ToolResultContent, ToolResultStatus, ToolUse
 from ..tool_provider import ToolProvider
 from ._compat import (
     MCP_V2,
@@ -109,7 +109,7 @@ from .mcp_tasks import (
     _UpdateTaskRequest,
     _UpdateTaskRequestParams,
 )
-from .mcp_types import MCPClientCredentials, MCPToolResult, MCPTransport, ToolsChanged
+from .mcp_types import MCPClientCredentials, MCPToolResult, MCPTransport, MetaProvider, ToolsChanged
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +320,7 @@ class MCPClient(ToolProvider):
         tasks_config: TasksConfig | None = None,
         on_tools_changed: ToolsChanged | None = None,
         meta: dict[str, Any] | None = None,
+        meta_provider: MetaProvider | None = None,
     ) -> None:
         """Initialize a new MCP Server connection.
 
@@ -368,6 +369,12 @@ class MCPClient(ToolProvider):
                 `call_tool_sync`/`call_tool_async`, including model-driven calls dispatched via `MCPAgentTool`,
                 which routes through `call_tool_async`. Trace context is merged on top. A per-call `meta`
                 argument to either method takes precedence over this client-level value.
+            meta_provider: Optional callback building the request metadata of each tool call made by an agent
+                through `MCPAgentTool`, from the call's tool use and the agent's invocation state. Use it when the
+                metadata differs between invocations of agents sharing the client, e.g. per-user values. The keys it
+                returns are merged over the client-level `meta`; returning None sends the client-level `meta`
+                alone. Not called by `call_tool_sync`/`call_tool_async`, which take `meta` directly. It runs on
+                the event loop, so keep it fast and non-blocking; an exception it raises fails the tool call.
 
         Raises:
             ValueError: If neither or both of `transport_callable` and `url` are provided, if
@@ -386,6 +393,7 @@ class MCPClient(ToolProvider):
         self._elicitation_callback = elicitation_callback
         self._progress_callback = progress_callback
         self._meta = meta
+        self._meta_provider = meta_provider
         self._on_tools_changed = on_tools_changed
         self._tools_refresh_in_progress = False
         self._tools_refresh_pending = False
@@ -521,6 +529,19 @@ class MCPClient(ToolProvider):
         unprompted, so a late-set callback works there immediately.
         """
         self._on_tools_changed = callback
+
+    def _resolve_tool_meta(self, tool_use: ToolUse, invocation_state: dict[str, Any]) -> dict[str, Any] | None:
+        """Build the request metadata of an agent's tool call, see `meta_provider` in `__init__`.
+
+        Returns None when there is no provider or it returns None, so that `call_tool_async` sends
+        the client-level metadata alone.
+        """
+        if self._meta_provider is None:
+            return None
+        provided = self._meta_provider(tool_use, invocation_state)
+        if provided is None:
+            return None
+        return {**(self._meta or {}), **provided}
 
     # ToolProvider interface methods
     async def load_tools(self, **kwargs: Any) -> Sequence[AgentTool]:

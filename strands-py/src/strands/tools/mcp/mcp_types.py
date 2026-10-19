@@ -9,7 +9,7 @@ from mcp.shared.memory import MessageStream
 from mcp.shared.message import SessionMessage
 from typing_extensions import NotRequired, Protocol, TypedDict
 
-from ...types.tools import ToolResult
+from ...types.tools import ToolResult, ToolUse
 from ._compat import GetSessionIdCallback
 
 if TYPE_CHECKING:
@@ -30,6 +30,22 @@ class ToolsChangedCallback(Protocol):
 
 ToolsChanged = Callable[[list[str], "list[MCPAgentTool]"], None] | ToolsChangedCallback
 """A tools-changed handler: the `**kwargs`-ready protocol or a plain two-argument callable."""
+
+
+class MetaProviderCallback(Protocol):
+    """Builds the request metadata (`_meta`) of a tool call that an agent makes through `MCPAgentTool`.
+
+    Implemented by a plain function as well — the `**kwargs` tail lets the calling
+    convention grow new keyword arguments without breaking existing providers.
+    """
+
+    def __call__(self, tool_use: ToolUse, invocation_state: dict[str, Any], **kwargs: Any) -> dict[str, Any] | None:
+        """Return the metadata of the call, or None to send only the client-level metadata."""
+        ...
+
+
+MetaProvider = Callable[[ToolUse, dict[str, Any]], dict[str, Any] | None] | MetaProviderCallback
+"""A metadata provider: the `**kwargs`-ready protocol or a plain two-argument callable."""
 
 
 class MCPClientCredentials(TypedDict):

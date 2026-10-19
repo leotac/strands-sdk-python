@@ -1,3 +1,4 @@
+import asyncio
 import threading
 from datetime import timedelta
 from unittest.mock import MagicMock
@@ -37,6 +38,7 @@ def mock_mcp_client():
         "toolUseId": "test-123",
         "content": [{"text": "Success result"}],
     }
+    mock_server._resolve_tool_meta.return_value = None
     return mock_server
 
 
@@ -156,6 +158,7 @@ async def test_stream(mcp_agent_tool, mock_mcp_client, alist):
         name="test_tool",
         arguments={"param": "value"},
         read_timeout_seconds=None,
+        meta=None,
         cancel_signal=cancel_signal,
     )
 
@@ -188,6 +191,7 @@ async def test_stream_with_timeout(mock_mcp_tool, mock_mcp_client, alist):
         name="test_tool",
         arguments={"param": "value"},
         read_timeout_seconds=timeout,
+        meta=None,
         cancel_signal=cancel_signal,
     )
 
@@ -204,13 +208,14 @@ async def test_stream_without_agent_cancel_signal(mcp_agent_tool, mock_mcp_clien
         name="test_tool",
         arguments={},
         read_timeout_seconds=None,
+        meta=None,
         cancel_signal=None,
     )
 
 
 @pytest.mark.asyncio
 async def test_stream_sends_client_meta_on_model_driven_calls(mock_transport, mock_session, alist):
-    """Test a model-driven call inherits the client-level meta, which stream() never passes itself."""
+    """Test a model-driven call inherits the client-level meta when there is no meta provider."""
     mock_content = MCPTextContent(type="text", text="done")
     received_meta = {}
 
@@ -236,3 +241,51 @@ async def test_stream_sends_client_meta_on_model_driven_calls(mock_transport, mo
     assert tru_events == [ToolResultEvent(exp_result)]
     # Trace context may be merged on top, so assert our key survives.
     assert received_meta["com.example/request_id"] == "abc-123"
+
+
+@pytest.mark.asyncio
+async def test_stream_passes_the_meta_resolved_by_the_client(mcp_agent_tool, mock_mcp_client, alist):
+    mock_mcp_client._resolve_tool_meta.return_value = {"com.example/user": "alice"}
+    tool_use = {"toolUseId": "test-123", "name": "test_tool", "input": {}}
+    invocation_state = {"user": "alice"}
+
+    await alist(mcp_agent_tool.stream(tool_use, invocation_state))
+
+    mock_mcp_client._resolve_tool_meta.assert_called_once_with(tool_use, invocation_state)
+    tru_meta = mock_mcp_client.call_tool_async.call_args.kwargs["meta"]
+    exp_meta = {"com.example/user": "alice"}
+    assert tru_meta == exp_meta
+
+
+@pytest.mark.asyncio
+async def test_stream_sends_the_meta_of_each_invocation_on_a_shared_client(mock_transport, mock_session, alist):
+    """Test concurrent invocations sharing a client each send their own provided meta, over the client-level one."""
+    received_metas = []
+
+    async def call_tool(name, arguments, read_timeout_seconds, progress_callback=None, meta=None, **kwargs):
+        received_metas.append(meta)
+        return MCPCallToolResult(isError=False, content=[MCPTextContent(type="text", text="done")])
+
+    mock_session.call_tool.side_effect = call_tool
+
+    def meta_provider(tool_use, invocation_state):
+        return {"com.example/user": invocation_state["user"]}
+
+    with MCPClient(
+        mock_transport["transport_callable"], meta={"com.example/app": "demo"}, meta_provider=meta_provider
+    ) as client:
+        agent_tool = MCPAgentTool(make_mcp_tool(), client)
+        tool_use = {"toolUseId": "test-123", "name": "test_tool", "input": {}}
+
+        await asyncio.gather(*(alist(agent_tool.stream(tool_use, {"user": user})) for user in ("alice", "bob")))
+
+    # Trace context may be merged on top, so compare only our keys.
+    tru_metas = sorted(
+        ({key: meta[key] for key in ("com.example/app", "com.example/user")} for meta in received_metas),
+        key=lambda meta: meta["com.example/user"],
+    )
+    exp_metas = [
+        {"com.example/app": "demo", "com.example/user": "alice"},
+        {"com.example/app": "demo", "com.example/user": "bob"},
+    ]
+    assert tru_metas == exp_metas
